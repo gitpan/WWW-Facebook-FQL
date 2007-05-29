@@ -8,13 +8,21 @@ WWW::Facebook::FQL - Simple interface to Facebook's FQL query language
 
   use WWW::Facebook::FQL;
 
-  ## Log in
-  my $fb = new WWW::Facebook::FQL email => $my_email, pass => $my_pass;
+  ## Connect and log in:
+  my $fb = new WWW::Facebook::FQL key => $public_key, private => $private_key;
+  $fb->login($email, $password);
+
   ## Get your own name and pic back:
   $fb->query("SELECT name, pic FROM user WHERE uid=$fb->{uid}");
+
   ## Get your friends' names and pics:
   $fb->query("SELECT name, pic FROM user WHERE uid IN "
            . "(SELECT uid2 FROM friend WHERE uid1 = $fb->{uid})");
+
+  ## Get results in manageable form:
+  use JSON::Syck; # or whatever...
+  $fb->format = 'JSON';
+  my $arrayref = JSON::Syck::Load $fb->query("...");
 
 =head1 DESCRIPTION
 
@@ -30,10 +38,15 @@ future.
 use URI::Escape;
 use WWW::Mechanize;
 use Digest::MD5 qw(md5_hex);
+require Exporter;
 use strict;
 
-use vars qw($VERSION);
-$VERSION = '0.01';
+use vars qw($VERSION @ISA @EXPORT_OK %EXPORT_TAGS);
+$VERSION = '0.03';
+
+@EXPORT_OK = qw(%FIELDS %IXFIELDS);
+%EXPORT_TAGS = (all => \@EXPORT_OK);
+@ISA = qw(Exporter);
 
 use vars qw($rest %FIELDS %IXFIELDS);
 $rest = 'http://api.facebook.com/restserver.php';
@@ -59,6 +72,14 @@ sub get
     ($self->{mech} ||= new WWW::Mechanize)->get(@_);
 }
 
+sub _request_nofail
+{
+    my $self = shift;
+    my $resp = $self->_request(@_);
+    die "Request failed:\n", $resp->decoded_content unless $resp->is_success;
+    $resp;
+}
+
 sub _request
 {
     my ($self, $method, %o) = @_;
@@ -77,19 +98,20 @@ sub _request
     if (!$resp->is_success) {
         $self->dprint(0, "Request '$url' failed.\n");
     }
-    $self->dprint(2, "RESPONSE ", '=' x 50, "\n", $resp->decoded_content,
-                  "\n", '=' x 70, "\n");
+    ## avoid decoding content unless printed
+    if ($self->{verbose} > 2) {
+        $self->dprint(2, "RESPONSE ", '=' x 50, "\n", $resp->decoded_content,
+                      "\n", '=' x 70, "\n");
+    }
     $resp;
 }
 
-## XXX - This doesn't use _request because the initial
-## auth.createToken is quite different.
 sub _get_auth_token
 {
     my ($self) = @_;
-    $self->{auth_token} = $self->{secret};
-    my $resp = $self->_request('auth.createToken', format => 'JSON');
-    $self->{auth_token} = eval $resp->decoded_content if $resp->is_success;
+    $self->{secret} = $self->{private};
+    my $resp = $self->_request_nofail('auth.createToken', format => 'JSON');
+    $self->{auth_token} = eval $resp->decoded_content;
 }
 
 sub _get_session
@@ -99,20 +121,15 @@ sub _get_session
     {
         local $rest = $rest;
         $rest =~ s/^http/https/;
-        $resp = $self->_request('auth.getSession', format => 'XML',
-                                auth_token => $self->{auth_token});
+        $resp = $self->_request_nofail('auth.getSession', format => 'XML',
+                                       auth_token => $self->{auth_token});
     }
     local $_ = $resp->decoded_content;
-    if (!$resp->is_success) {
-        $self->dprint(0, "Can't get session.\n");
-    } else {
-	$self->{old_secret} = $self->{secret};        
-        for my $word (qw(uid session_key expires secret)) {
-            ($self->{$word}) = /<$word>(.*?)<\/$word>/;
-        }
-        $self->dprint(1, "Session expires at ",
-                      scalar localtime($self->{expires}), "\n");
+    for my $word (qw(uid session_key expires secret)) {
+        ($self->{$word}) = /<$word>(.*?)<\/$word>/;
     }
+    $self->dprint(1, "Session expires at ",
+                  scalar localtime($self->{expires}), "\n");
 }
 
 =head2 C<$fb = new WWW::Facebook::FQL key =E<gt> value, ...>
@@ -133,7 +150,7 @@ Keyword arguments include
 You need to sign up for this on Facebook by joining the "Developers"
 group and requesting an API key.
 
-=item secret -- The private part of your API key.
+=item private -- The private part of your API key.
 
 =item format -- Data return format, either 'XML' (the default) or 'JSON'.
 
@@ -162,23 +179,31 @@ sub new
     }
     my %o = (@def, @_);
     my $self = bless \%o, $class;
-    $self->_get_auth_token;
+    return undef unless $self->_get_auth_token;
+    $self
+}
+
+sub login
+{
+    my $self = shift;
+    ($self->{email}, $self->{pass}) = @_ if @_;
     my $mech = $self->{mech};
     $mech->get("http://www.facebook.com/login.php?api_key=$self->{key}&v=1.0&auth_token=$self->{auth_token}&hide_checkbox=1&skipcookie=1");
-    ## XXX check response
+    die "Can't access login form:\n", $mech->res->decoded_content
+        unless $mech->success;
+
     my $resp = $mech->submit_form(with_fields => {
         email => $self->{email},
         pass => $self->{pass}
     });
-    if (!$resp->is_success) {
-        $self->dprint(0, "login failed: \n", $resp->decoded_content, "\n",
-                      '='x 70, "\n");
-        return undef;
-    }
+    die "Login failed:\n", $resp->decoded_content
+        unless $resp->is_success;
     $self->dprint(2, "Logged in as $self->{email}\n");
     ## XXX check response
     if ($mech->content =~ /Terms of Service/) {
         $mech->submit_form(form_name => 'confirm_grant_form');
+        die "TOS failed:\n", $mech->res->decoded_content
+            unless $mech->res->is_success;
         $self->dprint(2, "Agreed to terms of service.");
     }
     ## Get session key
@@ -186,7 +211,20 @@ sub new
     $self;
 }
 
-=head2 C<$result = $fb->query($QUERY)
+=head2 C<$fb-E<gt>logout>
+
+Log the current user out.
+
+=cut
+
+sub logout
+{
+    my $self = shift;
+    $self->{mech}->get("http://www.facebook.com/logout.php?api_key=$self->{key}&v=1.0&auth_token=$self->{auth_token}&confirm=1");
+    delete $self->{secret};
+}
+
+=head2 C<$result = $fb-E<gt>query($QUERY)
 
 Perform FQL query $QUERY, returning the result in format $FORMAT
 (either XML or JSON, JSON by default).  FQL is a lot like SQL, but
@@ -199,7 +237,37 @@ L<http://developers.facebook.com/documentation.php?v=1.0&doc=fql>.
 sub query
 {
     my ($self, $q) = @_;
+    if (!$self->{secret} || $self->{private} eq $self->{secret}) {
+        print STDERR "Must log in before querying.\n";
+        return;
+    }
     $self->_request('fql.query', query => $q)->decoded_content;
+}
+
+=head2 ACCESSORS
+
+=over
+
+=item C<$fb-E<gt>uid> (read-only)
+
+=item C<$fb-E<gt>email> (read-only)
+
+=item C<$fb-E<gt>verbose> (read-write)
+
+=item C<$fb-E<gt>format> (read-write)
+
+=back
+
+=cut
+
+BEGIN {
+    no strict;
+    for (qw(uid email)) {
+        eval "sub $_\n{ shift->{$_} }";
+    }
+    for (qw(verbose format)) {
+        eval "sub $_ :lvalue { shift->{$_} }";
+    }
 }
 
 BEGIN {
@@ -254,6 +322,10 @@ since FQL doesn't allow "SELECT *".
 
 Map table names to "indexable" fields, i.e. those fields that can be
 part of a WHERE clause.
+
+=head1 EXPORTS
+
+C<%FIELDS> and C<%IXFIELDS> can be exported with the ':all' tag.
 
 =head1 SEE ALSO
 
